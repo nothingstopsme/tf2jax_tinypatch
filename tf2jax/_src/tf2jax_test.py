@@ -17,13 +17,13 @@
 import inspect
 
 from absl.testing import parameterized
-
 import chex
+import flax
 from flax import linen as nn
 import jax
+from jax.experimental import jax2tf
 import jax.numpy as jnp
 import numpy as np
-
 import tensorflow as tf
 from tf2jax._src import config
 from tf2jax._src import tf2jax
@@ -61,6 +61,34 @@ class TestMLP(tf.Module):
     for layer in self.layers:
       x = layer(x)
     return x
+
+
+class FlaxTestDense(nn.Module):
+  """A Flax module that wraps a TestDense saved model."""
+
+  saved_model_path: str
+  input_dim: int
+
+  def setup(self):
+    self.m = tf.saved_model.load(self.saved_model_path)
+    if self.is_initializing():
+      _, params = tf2jax.convert(
+          tf.function(self.m.__call__),
+          tf.TensorSpec([None, self.input_dim], tf.float32),
+      )
+      params = flax.traverse_util.unflatten_dict(params, sep="/")
+      self.params = self.param("saved_model", lambda _: params)
+    else:
+      self.params = self.param("saved_model", lambda _: None)
+
+  def __call__(self, x: jax.Array) -> jax.Array:
+    fn, _ = tf2jax.convert(
+        tf.function(self.m.__call__),
+        tf.TensorSpec(x.shape, tf.float32),
+    )
+    params = flax.traverse_util.flatten_dict(self.params, sep="/")
+    y, _ = fn(params, x)
+    return y
 
 
 class FeaturesTest(tf.test.TestCase, parameterized.TestCase):
@@ -493,6 +521,71 @@ class FeaturesTest(tf.test.TestCase, parameterized.TestCase):
         ValueError, r"Some parameters are missing, \[\'bbb\'\]."
     ):
       self.variant(jax_func)({"aaa": jax_params["aaa"]}, np_inputs)
+
+  def test_export_saved_model_export_jax_module(self):
+    input_dim = 5
+    l = TestDense(input_dim=input_dim, output_size=5)
+    l.__call__ = tf.function(
+        l.__call__, input_signature=[tf.TensorSpec((None, input_dim))]
+    )
+
+    x_tf = tf.ones((2, input_dim))
+    y_tf = l(x_tf)
+    kernel_tf, bias_tf = l.variables
+    tf_export_dir = self.create_tempdir()
+    jax_export_dir = self.create_tempdir()
+    tf.saved_model.save(l, tf_export_dir)
+
+    module = FlaxTestDense(tf_export_dir, input_dim=input_dim)
+    x_jax = jnp.ones((2, input_dim))
+    y_jax, jax_params = module.init_with_output(jax.random.key(0), x_jax)
+
+    kernel_jax, bias_jax = jax.tree.leaves(jax_params)
+
+    np.testing.assert_array_equal(kernel_tf.numpy(), kernel_jax)
+    np.testing.assert_array_equal(bias_tf.numpy(), bias_jax)
+    np.testing.assert_allclose(y_tf.numpy(), y_jax, atol=1e-6, rtol=1e-6)
+
+    def model_fn(params, inputs):  # The JAX model function to export.
+      fm = FlaxTestDense(tf_export_dir, input_dim=input_dim)
+      return fm.apply(params, inputs)
+
+    class ExportWrapper(tf.Module):
+
+      def __init__(self, params):
+        super().__init__()
+        self._tf_fn = jax2tf.convert(model_fn)
+        self._params = params
+
+      @tf.function(
+          input_signature=[
+              tf.TensorSpec(shape=[1, input_dim], dtype=tf.float32)
+          ]
+      )
+      def __call__(self, x):
+        return self._tf_fn(self._params, x)
+
+    with config.override_config(
+        "skip_variables_evaluation_inside_tf_tracing", False
+    ), self.assertRaises(ValueError):
+      tf.saved_model.save(
+          ExportWrapper(jax_params),
+          jax_export_dir,
+          options=tf.saved_model.SaveOptions(
+              experimental_custom_gradients=False
+          ),
+      )
+
+    with config.override_config(
+        "skip_variables_evaluation_inside_tf_tracing", True
+    ):
+      tf.saved_model.save(
+          ExportWrapper(jax_params),
+          jax_export_dir,
+          options=tf.saved_model.SaveOptions(
+              experimental_custom_gradients=False
+          ),
+      )
 
 
 if __name__ == "__main__":

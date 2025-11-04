@@ -39,6 +39,11 @@ _config = dict(
     # converting `tensorflow_probability`'s `HiddenMarkovModel.posterior_mode`
     # to JAX. Here we allow to disable it.
     disable_assert_in_tensor_list_get_item=False,
+    # If True, avoids evaluating variables in a TF tracing context. Set to False
+    # when using tf2jax.convert from within a tf.function in TF2 mode (e.g. when
+    # exporting a JAX function using tf2jax.convert internally as a TensorFlow
+    # saved model).
+    skip_variables_evaluation_inside_tf_tracing=False,
 )
 
 

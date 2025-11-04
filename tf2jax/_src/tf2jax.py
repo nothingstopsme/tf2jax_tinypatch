@@ -537,7 +537,7 @@ def convert(
     exp_args, exp_kwargs = structured_inputs
     if exp_args:
       raise ValueError("If function_spec is None then only keyword arguments "
-                       f"are expectd, found args={exp_args} in structure.")
+                       f"are expected, found args={exp_args} in structure.")
     parameters = tuple([
         # TODO(b/266552275) Remove temporary fix for TF-Hub.
         inspect.Parameter(
@@ -999,7 +999,7 @@ def _convert(
     constants: A mapping from tensor names to constant values. The keys are a
       subset of captured_input_names.
     library: A mapping from function names to Callable. This is non-empty on
-      recurisve calls if the FunctionDefLibrary in the GraphDef is non-empty.
+      recursive calls if the FunctionDefLibrary in the GraphDef is non-empty.
 
   Returns:
     A tuple: the first is a Jax functions that takes a flat parameter dict and a
@@ -1068,7 +1068,7 @@ def _convert(
     raise ValueError(err_message)
 
   # Extract variables.
-  if tf.executing_eagerly():
+  if tf.executing_eagerly() or tf.inside_function():
     # Uniqueify variables with identical names.
     variables_tf = {}
     var_name_by_ref = {}
@@ -1082,11 +1082,23 @@ def _convert(
       variables_tf[var_name] = v
       var_name_by_ref[v.ref()] = var_name
 
-    variables = {
-        k: Variable(v.numpy(), v.trainable, v.name)
-        for k, v in variables_tf.items()
-    }
-  else:
+    if tf.inside_function():
+      # We cannot evaluate variables inside a tf.function.
+      variables = {}
+      if (
+          not config.get_config("skip_variables_evaluation_inside_tf_tracing")
+          and variable_map
+      ):
+        raise ValueError(
+            "Unable to to evaluate variables inside a TF tracing context, "
+            "and `skip_variables_evaluation_inside_tf_tracing` is False."
+        )
+    else:
+      variables = {
+          k: Variable(v.numpy(), v.trainable, v.name)
+          for k, v in variables_tf.items()
+      }
+  else:  # We are in TF1 mode
     variables_tf = {_parse_input(v.name): v for _, v in variable_map.items()}
     var_name_by_ref = {
         v.ref(): _parse_input(v.name) for v in variable_map.values()
@@ -1103,7 +1115,10 @@ def _convert(
 
   assert len(variable_map) == len(variables_tf)
   assert len(variable_map) == len(var_name_by_ref)
-  assert len(variable_map) == len(variables)
+  if not tf.inside_function() or not config.get_config(
+      "skip_variables_evaluation_inside_tf_tracing"
+  ):
+    assert len(variable_map) == len(variables)
 
   var_by_node = {k: var_name_by_ref[v.ref()] for k, v in variable_map.items()}
   node_by_var = {v: k for k, v in var_by_node.items()}
