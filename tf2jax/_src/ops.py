@@ -454,7 +454,7 @@ def _bit_cast(proto):
 @register_operation("BroadcastArgs")
 def _broadcast_args(proto):
   _check_attrs(proto, {"T"})
-  return lambda s0, s1: np.array(np.broadcast(np.zeros(s0), np.zeros(s1)).shape)
+  return lambda s0, s1: np.array(jnp.broadcast_shapes(s0, s1))
 
 
 class _CaseOp(_HigherOrderFunction):

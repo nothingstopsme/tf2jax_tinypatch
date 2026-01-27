@@ -15,11 +15,14 @@
 """Tests for tf2jax."""
 
 import contextlib
+import dataclasses
+from typing import Any
 
 from absl.testing import parameterized
 
 import chex
 import jax
+from jax import export
 from jax.experimental import checkify
 import numpy as np
 
@@ -34,6 +37,15 @@ import tree
 
 def _reorder(vals, inds):
   return [vals[idx] for idx in inds]
+
+
+@dataclasses.dataclass
+class _PolymorphicInput:
+  """Wrapper class containing information for polymorphic inputs."""
+
+  tf_spec: tf.TensorSpec
+  jax_spec: jax.ShapeDtypeStruct
+  concrete_value: Any
 
 
 class OpsTest(test_util.TestCase):
@@ -81,6 +93,84 @@ class OpsTest(test_util.TestCase):
       self.assertEqual(tf_res.shape, jax_res.shape)
       if not check_shape_only:
         self.assertAllClose(np.asarray(tf_res), jax_res, atol=atol)
+
+    return jax_results, new_jax_params
+
+  def _test_convert_polymorphic(
+      self,
+      tf_func,
+      inputs,
+      *,
+      check_shape_only=False,
+      functional=True,
+      jit_compile=True,
+      atol=1e-5,
+  ):
+    if not isinstance(inputs, (list, tuple)):
+      inputs = (inputs,)
+
+    # Call self._test_convert if there is no _PolymorphicInput.
+    self.assertTrue(any(isinstance(x, _PolymorphicInput) for x in inputs))
+
+    if not hasattr(tf_func, "get_concrete_function"):
+      tf_func = tf.function(tf_func, jit_compile=jit_compile)
+
+    def get_poly_attr_or_else(attr, else_fn=None):
+      """Returns the attr of a _PolymorphicInput otherwise apply `else_fn`."""
+
+      def mapper(x):
+        if isinstance(x, _PolymorphicInput):
+          return getattr(x, attr)
+        if else_fn is not None:
+          return else_fn(x)
+        return x
+
+      return mapper
+
+    jax_func, jax_params = tf2jax.convert(
+        tf_func,
+        *tree.map_structure(
+            get_poly_attr_or_else("tf_spec", np.zeros_like), inputs
+        ),
+    )
+    if functional:
+      self.assertEmpty(jax_params, "Expected no parameters for pure Ops.")
+
+    jax_func = self.variant(jax_func)
+
+    concrete_inputs = tree.map_structure(
+        get_poly_attr_or_else("concrete_value"), inputs
+    )
+    tf_results = tf_func(*concrete_inputs)
+
+    def assert_same(tf_results, jax_results):
+      """Compares the results of the TF and JAX functions."""
+      for tf_res, jax_res in utils.safe_zip(
+          tree.flatten(tf_results), tree.flatten(jax_results)
+      ):
+        self.assertEqual(tf_res.shape, jax_res.shape)
+        if not check_shape_only:
+          self.assertAllClose(
+              np.asarray(tf_res), np.asarray(jax_res), atol=atol
+          )
+
+    # Check the converted JAX function.
+    rng = jax.random.PRNGKey(42)
+    jax_results, new_jax_params = jax_func(
+        jax_params, *concrete_inputs, rng=rng
+    )
+    assert_same(tf_results, jax_results)
+
+    # Check exported JAX function.
+    exp_func = export.export(jax_func)(
+        jax_params,
+        *tree.map_structure(
+            get_poly_attr_or_else("jax_spec", np.zeros_like), inputs
+        ),
+    )
+    exp_results, new_exp_params = exp_func.call(jax_params, *concrete_inputs)
+    assert_same(tf_results, exp_results)
+    assert_same(new_jax_params, new_exp_params)
 
     return jax_results, new_jax_params
 
@@ -528,6 +618,54 @@ class OpsTest(test_util.TestCase):
     self._test_convert(raw_func, inputs)
 
   @chex.variants(with_jit=True, without_jit=True)
+  @parameterized.parameters(
+      ([1, 2], [3, 1]),
+      ([2, 3, 1], [1, 5]),
+      ([], [1]),
+      ([1], []),
+      ([], []),
+      ([3, 1, 2], [1, 5, 1]),
+  )
+  def test_broadcast_args(self, s0, s1):
+    x = np.zeros(s0, dtype=np.float32)
+    y = np.zeros(s1, dtype=np.float32)
+
+    def broadcast_args(x, y):
+      return tf.broadcast_to(
+          0.0, tf.broadcast_dynamic_shape(tf.shape(x), tf.shape(y))
+      )
+
+    self._test_convert(broadcast_args, [x, y])
+
+  @chex.variants(with_jit=True, without_jit=False)
+  def test_broadcast_args_polymorphic(self):
+
+    @tf.function
+    def broadcast_args(x, y):
+      return tf.broadcast_to(
+          0.0, tf.broadcast_dynamic_shape(tf.shape(x), tf.shape(y))
+      )
+
+    x = np.zeros((1, 2), dtype=np.float32)
+    y = np.zeros((3, 1), dtype=np.float32)
+    x_spec, y_spec = export.symbolic_args_specs((x, y), ("(_, x)", "(y, _)"))
+    self._test_convert_polymorphic(
+        broadcast_args,
+        [
+            _PolymorphicInput(
+                tf_spec=tf.TensorSpec(shape=(1, None), dtype=tf.float32),
+                jax_spec=x_spec,
+                concrete_value=x,
+            ),
+            _PolymorphicInput(
+                tf_spec=tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
+                jax_spec=y_spec,
+                concrete_value=y,
+            ),
+        ],
+    )
+
+  @chex.variants(with_jit=True, without_jit=True)
   def test_broadcast_to(self):
     inputs, shape = np.array([1, 2, 3]), (3, 3)
 
@@ -931,6 +1069,23 @@ class OpsTest(test_util.TestCase):
     def fill_static():
       return tf.zeros(fill(value))
     self._test_convert(fill_static, [])
+
+  @chex.variants(with_jit=True, without_jit=False)
+  def test_fill_polymorphic(self):
+    @tf.function
+    def fill(x):
+      return tf.zeros(shape=tf.shape(x), dtype=tf.float32)
+
+    x = np.zeros((2, 3), dtype=np.float32)
+    x_spec = export.symbolic_args_specs(x, "(a, b)")
+    self._test_convert_polymorphic(
+        fill,
+        _PolymorphicInput(
+            tf_spec=tf.TensorSpec(shape=(None, None), dtype=tf.float32),
+            jax_spec=x_spec,
+            concrete_value=x,
+        ),
+    )
 
   @chex.variants(with_jit=True, without_jit=True)
   @parameterized.named_parameters(

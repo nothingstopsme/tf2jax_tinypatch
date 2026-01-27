@@ -89,9 +89,18 @@ def is_poly_dim(x) -> bool:
     return False
 
 
+def _is_np(x):
+  """Checks if `x` is a numpy like type."""
+  # Special case for polymorphic shape tensors. Shape tensors are stored as 1-D
+  # np.array.
+  if isinstance(x, np.ndarray) and x.ndim == 1 and any(map(is_poly_dim, x)):
+    return False
+  return isinstance(x, _NP_LIKES) or is_poly_dim(x)
+
+
 def _get_np(*args):
   """Select numpy backend based on input types."""
-  no_jax = all((isinstance(x, _NP_LIKES) or is_poly_dim(x)) for x in args)
+  no_jax = all(map(_is_np, args))
   return np if no_jax else jnp
 
 
@@ -156,7 +165,7 @@ def empty(shape, dtype: tf.DType, init: bool):
 
 
 def full(shape, fill_value, dtype: tf.DType):
-  dtype = _get_dtypes(shape)[dtype]
+  dtype = _get_dtypes(shape, fill_value)[dtype]
   return _get_np(shape, fill_value).full(shape, fill_value, dtype=dtype)
 
 
