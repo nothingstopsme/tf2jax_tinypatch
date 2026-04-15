@@ -227,9 +227,14 @@ def _xla_call_module(proto):
       return target_platforms.index(jax_backend)
 
   if version >= 4:
-    mhlo_text = jex.mlir.deserialize_portable_artifact(
-        proto.attr["module"].s
-    )
+    with mlir.make_ir_context():
+      result = jex.mlir.deserialize_portable_artifact(
+          proto.attr["module"].s
+      )
+      if isinstance(result, ir.Module):
+        mhlo_text = mlir.module_to_string(result)
+      else:
+        mhlo_text = result
   else:
     with mlir.make_ir_context():
       module = ir.Module.parse(proto.attr["module"].s)
